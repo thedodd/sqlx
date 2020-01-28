@@ -64,6 +64,15 @@ impl Hash for String {
     }
 }
 
+macro_rules! conditional_rollback {
+    ($conn: ident, $ident: ident) => {
+        if let Err(err) = $ident {
+            $conn.send("rollback").await?;
+            return Err(err)?;
+        }
+    }
+}
+
 async fn blah<C, P>(mut conn: C, path: P) -> anyhow::Result<()> 
 where 
     C: Connection,
@@ -74,7 +83,9 @@ where
     String: Encode<<C as sqlx::Executor>::Database>,
     Migration: FromRow<<<C as sqlx::Executor>::Database as Database>::Row>,
     P: AsRef<Path>, {
-    sqlx::query("create table if not exists sqlx_migrations (migration text not null primary key, hash bytea not null)").execute(&mut conn).await?;
+    conn.send("begin").await?;
+
+    conn.send("create table if not exists sqlx_migrations (migration text not null primary key, hash bytea not null)").await?;
 
     let mut files = fs::read_dir(path)?
         .filter_map(Result::ok)
@@ -90,24 +101,29 @@ where
         let filename = file.file_name().into_string().unwrap();
 
         if let Ok(migration_to_run) = fs::read_to_string(file.path()) {
-            if migration_to_run != "" {
-                let hash = migration_to_run.hash();
-                if let Some(upstream_migration) = migrations.get(index) {
-                    if std::cmp::Ordering::Equal != hash.cmp(&upstream_migration.hash) {
-                        return Err(anyhow!("{:?} is not synced with the database.", filename));
-                    }
-                } else {
-                    sqlx::query(&migration_to_run).execute(&mut conn).await?;
-
-                    sqlx::query("INSERT INTO sqlx_migrations (migration, hash) VALUES ($1, $2)")
-                        .bind(filename)
-                        .bind(hash)
-                        .execute(&mut conn)
-                        .await?;
+            let hash = migration_to_run.hash();
+            if let Some(upstream_migration) = migrations.get(index) {
+                if std::cmp::Ordering::Equal != hash.cmp(&upstream_migration.hash) {
+                    conn.send("rollback").await?;
+                    return Err(anyhow!("{:?} is not synced with the database.", filename));
                 }
+            } else {
+                let result = conn.send(&migration_to_run).await;
+                conditional_rollback!(conn, result);
+
+                let result = sqlx::query("INSERT INTO sqlx_migrations (migration, hash) VALUES ($1, $2)")
+                    .bind(filename)
+                    .bind(hash)
+                    .execute(&mut conn)
+                    .await;
+                conditional_rollback!(conn, result);
             }
+        } else {
+
         }
     }
+
+    conn.send("commit").await?;
 
     Ok(())
 }
